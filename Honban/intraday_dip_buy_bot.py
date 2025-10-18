@@ -12,7 +12,7 @@ import logging
 from kabu_api import KabuAPI
 from line_messaging_api_notifier import line_notify
 
-class DayTraderBot:
+class IntradayDipBuyBot:
     def __init__(self):
         self._setup_logger()
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -78,7 +78,7 @@ class DayTraderBot:
             self.logger.handlers.clear()
         log_dir = os.path.join(os.path.dirname(__file__), "logs")
         os.makedirs(log_dir, exist_ok=True)
-        log_file_path = os.path.join(log_dir, "day_trader_bot.log")
+        log_file_path = os.path.join(log_dir, "intraday_dip_buy_bot.log")
         file_handler = RotatingFileHandler(log_file_path, maxBytes=1024000, backupCount=5, encoding='utf-8')
         file_handler.setLevel(logging.INFO)
         console_handler = logging.StreamHandler()
@@ -480,7 +480,7 @@ class DayTraderBot:
 if __name__ == "__main__":
     bot = None
     try:
-        bot = DayTraderBot()
+        bot = IntradayDipBuyBot()
         bot.run()
     except Exception as e:
         if bot and hasattr(bot, 'logger'):

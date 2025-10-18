@@ -12,7 +12,7 @@ from datetime import datetime, time as dt_time
 from kabu_api import KabuAPI
 from line_messaging_api_notifier import line_notify
 
-class TradingBot:
+class YoritsukiGapShortBot:
     def __init__(self):
         self._setup_logger()
         # --- 設定ファイルの読み込み ---
@@ -63,7 +63,7 @@ class TradingBot:
         os.makedirs(log_dir, exist_ok=True)
 
         # Use a rotating file handler
-        log_file_path = os.path.join(log_dir, "trading_bot.log")
+        log_file_path = os.path.join(log_dir, "yoritsuki_gap_short_bot.log")
         # 100KB per file, keep 1 backup
         file_handler = RotatingFileHandler(log_file_path, maxBytes=102400, backupCount=1, encoding='utf-8')
         file_handler.setLevel(logging.INFO)
@@ -254,7 +254,7 @@ if __name__ == "__main__":
     bot = None
     logger = logging.getLogger("TradingBotLogger")
     try:
-        bot = TradingBot()
+        bot = YoritsukiGapShortBot()
         logger = bot.logger
         bot.run()
     except Exception as e:
@@ -263,7 +263,7 @@ if __name__ == "__main__":
         else:
             log_dir = "logs"
             os.makedirs(log_dir, exist_ok=True)
-            log_file_path = os.path.join(log_dir, "trading_bot.log")
+            log_file_path = os.path.join(log_dir, "yoritsuki_gap_short_bot.log")
             logging.basicConfig(
                 level=logging.INFO,
                 format='%(asctime)s - %(levelname)s - %(message)s',
