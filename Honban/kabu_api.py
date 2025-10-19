@@ -74,6 +74,80 @@ class KabuAPI:
                 self.logger.error(f"Response content: {e.response.text}")
             return False, str(e)
 
+    def send_short_sell_order(self, symbol, exchange, qty, password):
+        """空売り注文を送信する"""
+        payload = {
+            "Password": password,
+            "Symbol": str(symbol),
+            "Exchange": exchange,
+            "SecurityType": 1,
+            "Side": "1",
+            "CashMargin": 3,
+            "DelivType": 2,
+            "FundType": self.trade_type,
+            "AccountType": 4,
+            "Qty": qty,
+            "FrontOrderType": 10,
+        }
+        return self._send_order(payload)
+
+    def send_market_order(self, symbol, exchange, qty, side):
+        """成行注文を送信する"""
+        payload = {
+            "Password": self.trade_password,
+            "Symbol": str(symbol),
+            "Exchange": exchange,
+            "SecurityType": 1,
+            "Side": side,
+            "CashMargin": 1,
+            "DelivType": 2,
+            "FundType": self.trade_type,
+            "AccountType": 4,
+            "Qty": qty,
+            "FrontOrderType": 10,
+        }
+        return self._send_order(payload)
+
+    def send_stop_sell_order(self, symbol, exchange, qty, password, trigger_price):
+        """逆指値の売り注文を送信する"""
+        payload = {
+            "Password": password,
+            "Symbol": str(symbol),
+            "Exchange": exchange,
+            "SecurityType": 1,
+            "Side": "1",
+            "CashMargin": 1,
+            "DelivType": 2,
+            "FundType": self.trade_type,
+            "AccountType": 4,
+            "Qty": qty,
+            "FrontOrderType": 20,
+            "Condition": {
+                "TriggerSec": 1,
+                "TriggerPrice": trigger_price,
+                "UnderOver": 2
+            }
+        }
+        return self._send_order(payload)
+
+    def send_limit_sell_order(self, symbol, exchange, qty, password, price):
+        """指値の売り注文を送信する"""
+        payload = {
+            "Password": password,
+            "Symbol": str(symbol),
+            "Exchange": exchange,
+            "SecurityType": 1,
+            "Side": "1",
+            "CashMargin": 1,
+            "DelivType": 2,
+            "FundType": self.trade_type,
+            "AccountType": 4,
+            "Qty": qty,
+            "FrontOrderType": 13,
+            "Price": price
+        }
+        return self._send_order(payload)
+
     def get_order(self, order_id):
         """注文情報を取得する"""
         url = f"{self.api_url}/orders/{order_id}"

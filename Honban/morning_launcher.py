@@ -13,8 +13,8 @@ PYTHON_EXE = sys.executable
 # Define the paths to the scripts
 GET_KABUKA_SCRIPT = "c:/share/MorinoFolder/Python/YoritsukiTrader/Honban/getKabuka1m.py"
 GET_BOARD_DATA_SCRIPT = "c:/share/MorinoFolder/Python/YoritsukiTrader/Honban/get_board_data.py"
-TRADING_BOT_SCRIPT = "c:/share/MorinoFolder/Python/YoritsukiTrader/Honban/trading_bot.py"
-DAY_TRADER_BOT_SCRIPT = "c:/share/MorinoFolder/Python/YoritsukiTrader/Honban/day_trader_bot.py"
+TRADING_BOT_SCRIPT = "c:/share/MorinoFolder/Python/YoritsukiTrader/Honban/yoritsuki_gap_short_bot.py"
+DAY_TRADER_BOT_SCRIPT = "c:/share/MorinoFolder/Python/YoritsukiTrader/Honban/intraday_dip_buy_bot.py"
 
 def setup_logger():
     """Sets up a rotating file logger."""
