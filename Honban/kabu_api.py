@@ -101,10 +101,12 @@ class KabuAPI:
             "Side": side,
             "CashMargin": 1,
             "DelivType": 2,
-            "FundType": self.trade_type,
+            "FundType": "AA",
             "AccountType": 4,
             "Qty": qty,
             "FrontOrderType": 10,
+            "ExpireDay": 0,
+            "Price": 0
         }
         return self._send_order(payload)
 
@@ -161,6 +163,40 @@ class KabuAPI:
             return True, order_info
         except requests.RequestException as e:
             self.logger.error(f"[ERROR] 注文情報取得失敗: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                self.logger.error(f"Response content: {e.response.text}")
+            return False, str(e)
+
+    def get_symbol_info(self, symbol, exchange):
+        """銘柄情報を取得する"""
+        url = f"{self.api_url}/symbol/{symbol}@{exchange}"
+        headers = {'Content-Type': 'application/json', 'X-API-KEY': self.token}
+        try:
+            verify_ssl = self.api_protocol != 'https'
+            response = requests.get(url, headers=headers, verify=verify_ssl)
+            response.raise_for_status()
+            symbol_info = response.json()
+            self.logger.info(f"[API] 銘柄情報取得成功: {symbol_info}")
+            return True, symbol_info
+        except requests.RequestException as e:
+            self.logger.error(f"[ERROR] 銘柄情報取得失敗: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                self.logger.error(f"Response content: {e.response.text}")
+            return False, str(e)
+
+    def get_board_info(self, symbol, exchange):
+        """板情報を取得する"""
+        url = f"{self.api_url}/board/{symbol}@{exchange}"
+        headers = {'Content-Type': 'application/json', 'X-API-KEY': self.token}
+        try:
+            verify_ssl = self.api_protocol != 'https'
+            response = requests.get(url, headers=headers, verify=verify_ssl)
+            response.raise_for_status()
+            board_info = response.json()
+            self.logger.info(f"[API] 板情報取得成功: {board_info}")
+            return True, board_info
+        except requests.RequestException as e:
+            self.logger.error(f"[ERROR] 板情報取得失敗: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 self.logger.error(f"Response content: {e.response.text}")
             return False, str(e)
