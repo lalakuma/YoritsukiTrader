@@ -8,6 +8,7 @@ from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, time as dt_time, timedelta
 import logging
+import threading
 
 from kabu_api import KabuAPI
 from line_messaging_api_notifier import line_notify
@@ -65,6 +66,9 @@ class IntradayDipBuyBot:
         self.lowest_price_value = float('inf')
         self.lowest_price_bar_index = -1
         self.reversal_point = None
+        self.dip_start_timestamp = None
+        self.ticks_lock = threading.Lock()
+        self.entry_order_check_retries = 0
         self.logger.info("--- Bot Initialized ---")
 
         self.last_market_status_logged = None
@@ -124,11 +128,15 @@ class IntradayDipBuyBot:
             self.logger.error(f"Failed to save bar to database: {e}", exc_info=True)
 
     def _aggregate_ticks(self):
-        if not self.ticks_in_current_bar:
+        with self.ticks_lock:
+            ticks_to_process = self.ticks_in_current_bar
+            self.ticks_in_current_bar = []
+
+        if not ticks_to_process:
             self.logger.debug("No ticks in current bar to aggregate.")
             return False
         self.logger.debug("Aggregating ticks to new 1-min bar...")
-        df_ticks = pd.DataFrame(self.ticks_in_current_bar, columns=['Timestamp', 'Price'])
+        df_ticks = pd.DataFrame(ticks_to_process, columns=['Timestamp', 'Price'])
         df_ticks['Timestamp'] = pd.to_datetime(df_ticks['Timestamp'])
         
         bar_open = df_ticks['Price'].iloc[0]
@@ -143,7 +151,6 @@ class IntradayDipBuyBot:
         self.df_1min = pd.concat([self.df_1min, new_bar])
         self._save_bar_to_db(new_bar)
         self.logger.info(f"New 1-min bar aggregated: O={new_bar['Open'].iloc[0]} H={new_bar['High'].iloc[0]} L={new_bar['Low'].iloc[0]} C={new_bar['Close'].iloc[0]}")
-        self.ticks_in_current_bar = []
         return True
 
     def _update_setup_signal(self):
@@ -157,6 +164,9 @@ class IntradayDipBuyBot:
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
         }).dropna()
 
+        # 9:00のバーは不完全なデータなので除外する
+        df_setup = df_setup[df_setup.index.time != dt_time(9, 0)]
+
         if len(df_setup) < 3:
             self.logger.debug(f"Not enough resampled bars to check for setup signal (need 3, have {len(df_setup)}).")
             return
@@ -164,6 +174,7 @@ class IntradayDipBuyBot:
         self.logger.debug(f"Checking for setup signal on {len(df_setup)} resampled bars.")
 
         for j in range(len(df_setup)):
+            # 1. Detect dip condition
             if j >= 2:
                 close_j = df_setup.iloc[j]['Close']
                 close_j_1 = df_setup.iloc[j-1]['Close']
@@ -171,21 +182,33 @@ class IntradayDipBuyBot:
                 self.logger.debug(f"Setup signal check: C={close_j}, C-1={close_j_1}, C-2={close_j_2}")
                 if (close_j < close_j_1) and (close_j_1 < close_j_2):
                     if not self.dip_flag_on:
-                        self.logger.info(f"DIP FLAG ON at {df_setup.index[j].time()} based on 2 lower closes.")
                         self.dip_flag_on = True
+                        self.dip_start_timestamp = df_setup.index[j]
+                        self.logger.info(f"DIP FLAG ON at {self.dip_start_timestamp.time()}. Initiating search for lowest price.")
+                        # Reset lowest price search state whenever a new dip sequence starts
+                        self.lowest_price_value = float('inf')
+                        self.lowest_price_bar_index = -1
             
+            # 2. If dip mode is active, find the lowest price and set reversal point
             if self.dip_flag_on:
-                self.logger.debug(f"Dip flag is ON. Checking lowest price: current Low={df_setup.iloc[j]['Low']}, stored lowest={self.lowest_price_value}")
-                if df_setup.iloc[j]['Low'] < self.lowest_price_value:
-                    self.lowest_price_value = df_setup.iloc[j]['Low']
-                    self.lowest_price_bar_index = j
-                    self.logger.info(f"New lowest price bar found at {df_setup.index[j].time()}, Low: {self.lowest_price_value}")
+                # Ensure we only process bars at or after the dip started
+                if self.dip_start_timestamp and df_setup.index[j] >= self.dip_start_timestamp:
+                    self.logger.debug(f"Dip flag is ON. Checking lowest price: current Low={df_setup.iloc[j]['Low']}, stored lowest={self.lowest_price_value}")
+                    if df_setup.iloc[j]['Low'] < self.lowest_price_value:
+                        self.lowest_price_value = df_setup.iloc[j]['Low']
+                        self.lowest_price_bar_index = j
+                        self.logger.info(f"New lowest price bar found at {df_setup.index[j].time()}, Low: {self.lowest_price_value}")
                 
+                # Check to set reversal point. This can happen on any iteration 'j' after a low is found.
                 if self.lowest_price_bar_index != -1 and j >= self.lowest_price_bar_index + 2:
-                    reversal_point_candidate = df_setup.iloc[self.lowest_price_bar_index]['High']
-                    if self.reversal_point != reversal_point_candidate:
-                        self.reversal_point = reversal_point_candidate
-                        self.logger.info(f"REVERSAL POINT SET: {self.reversal_point} (High of bar at {df_setup.index[self.lowest_price_bar_index].time()}) ")
+                    if self.lowest_price_bar_index >= 2:
+                        reversal_point_candidate = df_setup.iloc[self.lowest_price_bar_index - 2]['High']
+                        if self.reversal_point != reversal_point_candidate:
+                            self.reversal_point = reversal_point_candidate
+                            self.logger.info(f"REVERSAL POINT SET: {self.reversal_point} (High of bar 2 bars before lowest. Lowest bar time: {df_setup.index[self.lowest_price_bar_index].time()})")
+                    else:
+                        # This warning should now only appear if a valid dip happens but there aren't 2 prior bars in the whole dataset.
+                        self.logger.warning(f"Cannot set reversal point: not enough bars before the lowest price bar (index: {self.lowest_price_bar_index}).")
     
     def on_message(self, ws, message):
         try:
@@ -201,7 +224,8 @@ class IntradayDipBuyBot:
 
             if price:
                 self.current_price = float(price)
-                self.ticks_in_current_bar.append((datetime.now(), self.current_price))
+                with self.ticks_lock:
+                    self.ticks_in_current_bar.append((datetime.now(), self.current_price))
                 self.logger.debug(f"Received price: {self.current_price} at {datetime.now().strftime('%H:%M:%S.%f')}")
                 now = time.time()
                 if now - self.last_price_log_time > 10:
@@ -365,54 +389,96 @@ class IntradayDipBuyBot:
             self.logger.info(f"Market buy order placed successfully. Order ID: {self.entry_order_id}")
             self._send_line_notification([f"【エントリー注文】{self.ticker} 押し目買い (成行)"], "注文")
             self.state = 'WAITING_FOR_ENTRY'
+            self.entry_order_check_retries = 0 # Reset retry counter
             self.logger.info("==> STATE: WAITING_FOR_ENTRY")
+            time.sleep(2) # 約定情報がAPIに反映されるのを待つ
             self.reversal_point = None
             self.dip_flag_on = False
             self.lowest_price_value = float('inf')
             self.lowest_price_bar_index = -1
+            self.dip_start_timestamp = None
         else:
             self.logger.error(f"Failed to place entry order: {order_info}", exc_info=True)
             self._send_line_notification([f"【エラー】{self.ticker}のエントリー注文に失敗しました。", f"エラー: {order_info}"], "エラー")
             self.is_bot_running = False
 
     def _handle_state_waiting_for_entry(self):
-        self.logger.debug(f"Checking status of entry order {self.entry_order_id}...")
-        success, order_info = self.api.get_order(self.entry_order_id)
+        self.logger.debug(f"Checking execution for order {self.entry_order_id} by fetching all orders...")
+        success, orders = self.api.get_orders_list()
+
         if not success:
-            self.logger.error(f"Failed to get order info for {self.entry_order_id}. Stopping.", exc_info=True)
+            self.logger.error(f"Failed to get orders list. Stopping bot. Error: {orders}")
             self.is_bot_running = False
             return
-        # State 6: 約定, State 5: 終了（全約定含む）. Price > 0 で約定と判断
-        if order_info and order_info.get('State') in [5, 6] and order_info.get('Price', 0) > 0:
-            self.entry_price = float(order_info.get('Price'))
-            self.entry_time = datetime.now()
-            self.logger.info(f"Entry order {self.entry_order_id} executed at {self.entry_price}! (State: {order_info.get('State')})")
-            self._send_line_notification([f"【エントリー約定】{self.ticker}", f"価格: {self.entry_price}"], "約定")
-            self.stop_loss_price = round(self.entry_price * (1 - self.stop_loss_percent / 100))
-            self.take_profit_price = round(self.entry_price * (1 + self.take_profit_percent / 100))
-            self.logger.info(f"SL set to {self.stop_loss_price}, TP set to {self.take_profit_price}")
-            self.logger.info(f"Placing stop loss order at {self.stop_loss_price}")
-            sl_success, sl_order_info = self.api.send_stop_sell_order(
-                self.ticker, self.exchange, self.qty, self.trade_password, self.stop_loss_price
-            )
-            if sl_success:
-                self.stop_loss_order_id = sl_order_info['OrderId']
-                self.logger.info(f"Stop loss order placed successfully. Order ID: {self.stop_loss_order_id}")
-                self.state = 'POSITION_OPEN'
-                self.logger.info("==> STATE: POSITION_OPEN")
-            else:
-                self.logger.error(f"CRITICAL: Failed to place stop loss order after entry! {sl_order_info}", exc_info=True)
-                self._send_line_notification(["【緊急エラー】エントリー後に損切り注文の発注に失敗しました。手動対応が必要です。"], "エラー")
-                self.is_bot_running = False
-        # State 3: 待機（発注待機・訂正待機・取消待機）, State 5: 失敗・キャンセル
-        elif order_info and order_info.get('State') in [3, 5]:
-            self.logger.warning(f"Entry order {self.entry_order_id} failed or was cancelled. State: {order_info.get('State')}")
+
+        found_order = None
+        for order in orders:
+            if order.get('ID') == self.entry_order_id:
+                found_order = order
+                break
+
+        if found_order:
+            # 注文が見つかった場合、その状態を確認する
+            order_state = found_order.get('State')
+            if order_state in [5, 6]: # 5:終了(全約定/取消済), 6:約定
+                # 約定済みの場合、約定価格を取得する
+                execution_price = 0
+                if found_order.get('Details'):
+                    for detail in found_order['Details']:
+                        if detail.get('RecType') == 8: # 8:約定
+                            execution_price = detail.get('Price', 0)
+                            break
+                
+                if execution_price > 0:
+                    self.entry_price = execution_price
+                    self.entry_time = datetime.now()
+                    self.logger.info(f"Entry order {self.entry_order_id} executed at {self.entry_price}!")
+                    self._send_line_notification([f"【エントリー約定】{self.ticker}", f"価格: {self.entry_price}"], "約定")
+
+                    # SL/TPを計算し、損切り注文を出す
+                    self.stop_loss_price = round(self.entry_price * (1 - self.stop_loss_percent / 100))
+                    self.take_profit_price = round(self.entry_price * (1 + self.take_profit_percent / 100))
+                    self.logger.info(f"SL set to {self.stop_loss_price}, TP set to {self.take_profit_price}")
+                    
+                    sl_success, sl_order_info = self.api.send_stop_sell_order(
+                        self.ticker, self.exchange, self.qty, self.trade_password, self.stop_loss_price
+                    )
+                    
+                    if sl_success:
+                        self.stop_loss_order_id = sl_order_info['OrderId']
+                        self.logger.info(f"Stop loss order placed successfully. Order ID: {self.stop_loss_order_id}")
+                        self.state = 'POSITION_OPEN'
+                        self.logger.info("==> STATE: POSITION_OPEN")
+                    else:
+                        self.logger.error(f"CRITICAL: Failed to place stop loss order after entry! {sl_order_info}", exc_info=True)
+                        self._send_line_notification(["【緊急エラー】エントリー後に損切り注文の発注に失敗しました。手動対応が必要です。"], "エラー")
+                        self.is_bot_running = False
+                    return
+                else:
+                    self.logger.warning(f"Order {self.entry_order_id} is executed but execution price is zero. Retrying...")
+
+            elif order_state in [3, 5]: # 3:待機, 5:終了(注文失敗)
+                 self.logger.warning(f"Entry order {self.entry_order_id} failed or was cancelled. State: {order_state}")
+                 self.state = 'IDLE'
+                 self.logger.info("==> STATE: IDLE")
+                 self.entry_order_id = None
+                 return
+
+        # 注文が見つからない場合のリトライ処理
+        if self.entry_order_check_retries < 10:
+            self.entry_order_check_retries += 1
+            self.logger.info(f"Order {self.entry_order_id} not yet found in orders list. Retrying... ({self.entry_order_check_retries}/10)")
+            time.sleep(1)
+        else:
+            self.logger.error(f"CRITICAL: Order {self.entry_order_id} not found after 10 retries. Assuming order failed.")
+            self._send_line_notification([f"【緊急エラー】{self.ticker}の注文がリストに見つかりませんでした。手動確認が必要です。"], "エラー")
             self.state = 'IDLE'
             self.logger.info("==> STATE: IDLE")
-            self.entry_order_id = None
 
     def _handle_state_position_open(self):
         self.logger.debug(f"Position open. SL={self.stop_loss_price}, TP={self.take_profit_price}. Current={self.current_price}")
+        
+        # 1. 利確価格に達したかチェック
         if self.current_price >= self.take_profit_price:
             self.logger.info(f"Take profit price {self.take_profit_price} reached! Current price: {self.current_price}")
             self.logger.info(f"Cancelling stop loss order {self.stop_loss_order_id} before taking profit.")
@@ -425,23 +491,55 @@ class IntradayDipBuyBot:
                 self.logger.error(f"CRITICAL: Failed to send cancellation for stop loss order {self.stop_loss_order_id}. {cancel_info}", exc_info=True)
                 self._send_line_notification(["【緊急エラー】損切り注文のキャンセルに失敗しました。手動対応が必要です。"], "エラー")
                 self.is_bot_running = False
-        success, order_info = self.api.get_order(self.stop_loss_order_id)
-        if success and order_info and order_info.get('State') == 6:
-            self.logger.warning(f"Stop loss order {self.stop_loss_order_id} was executed. State: {order_info.get('State')}")
-            profit = (float(order_info.get('Price')) - self.entry_price) * self.qty
-            self._send_line_notification([f"【決済：損切り】{self.ticker}", f"価格: {order_info.get('Price')}", f"損益: {profit}"], "決済")
-            self.state = 'CLOSING'
-            self.logger.info("==> STATE: CLOSING")
+            return # 次のループでキャンセル状態を処理する
+
+        # 2. 損切りが約定したかチェック（全注文リストから確認）
+        success, orders = self.api.get_orders_list()
+        if not success:
+            self.logger.warning("Could not get orders list to check for stop loss execution. Will retry on next tick.")
+            return
+
+        for order in orders:
+            if order.get('ID') == self.stop_loss_order_id:
+                if order.get('State') in [5, 6]: # 5:終了, 6:約定
+                    execution_price = 0
+                    if order.get('Details'):
+                        for detail in order['Details']:
+                            if detail.get('RecType') == 8: # 8:約定
+                                execution_price = detail.get('Price', 0)
+                                break
+                    
+                    if execution_price > 0:
+                        self.logger.warning(f"Stop loss order {self.stop_loss_order_id} was executed at {execution_price}.")
+                        profit = (execution_price - self.entry_price) * self.qty
+                        self._send_line_notification([f"【決済：損切り】{self.ticker}", f"価格: {execution_price}", f"損益: {profit}"], "決済")
+                        self.state = 'CLOSING'
+                        self.logger.info("==> STATE: CLOSING")
+                break # 該当注文を見つけたらループを抜ける
 
     def _handle_state_waiting_for_cancel(self):
         self.logger.debug(f"Checking status of cancelled stop loss order {self.stop_loss_order_id}...")
-        success, order_info = self.api.get_order(self.stop_loss_order_id)
+        success, orders = self.api.get_orders_list()
+
         if not success:
-            self.logger.error(f"Failed to get order info for {self.stop_loss_order_id}. Stopping.", exc_info=True)
+            self.logger.error(f"Failed to get orders list while waiting for cancel confirmation. Stopping.", exc_info=True)
             self.is_bot_running = False
             return
-        if order_info and order_info.get('State') == 5:
-            self.logger.info(f"Stop loss order {self.stop_loss_order_id} confirmed cancelled. State: {order_info.get('State')}")
+
+        found_order = None
+        for order in orders:
+            if order.get('ID') == self.stop_loss_order_id:
+                found_order = order
+                break
+        
+        if not found_order:
+            self.logger.error(f"Could not find stop loss order {self.stop_loss_order_id} in list. Stopping.", exc_info=True)
+            self.is_bot_running = False
+            return
+
+        order_state = found_order.get('State')
+        if order_state == 5: # 5:終了(取消済)
+            self.logger.info(f"Stop loss order {self.stop_loss_order_id} confirmed cancelled. State: {order_state}")
             self.stop_loss_order_id = None
             self.logger.info(f"Placing limit sell order to take profit at {self.take_profit_price}.")
             tp_success, tp_order_info = self.api.send_limit_sell_order(
@@ -457,12 +555,21 @@ class IntradayDipBuyBot:
                 self.logger.error(f"CRITICAL: Failed to place take profit order! {tp_order_info}", exc_info=True)
                 self._send_line_notification(["【緊急エラー】利確注文の発注に失敗しました。手動対応が必要です。"], "エラー")
                 self.is_bot_running = False
-        elif order_info and order_info.get('State') == 6:
-            self.logger.warning(f"Stop loss order {self.stop_loss_order_id} was executed before it could be cancelled. State: {order_info.get('State')}")
-            profit = (float(order_info.get('Price')) - self.entry_price) * self.qty
-            self._send_line_notification([f"【決済：損切り】{self.ticker}", f"価格: {order_info.get('Price')}", f"損益: {profit}"], "決済")
+        
+        elif order_state == 6: # 6:約定
+            self.logger.warning(f"Stop loss order {self.stop_loss_order_id} was executed before it could be cancelled. State: {order_state}")
+            execution_price = 0
+            if found_order.get('Details'):
+                for detail in found_order['Details']:
+                    if detail.get('RecType') == 8:
+                        execution_price = detail.get('Price', 0)
+                        break
+            profit = (execution_price - self.entry_price) * self.qty
+            self._send_line_notification([f"【決済：損切り】{self.ticker}", f"価格: {execution_price}", f"損益: {profit}"], "決済")
             self.state = 'CLOSING'
             self.logger.info("==> STATE: CLOSING")
+        else:
+            self.logger.info(f"Stop loss order {self.stop_loss_order_id} is still in state {order_state}. Waiting for cancellation to complete...")
 
     def _handle_state_closing(self):
         self.logger.info("Trade cycle complete. Resetting for next opportunity.")
@@ -476,6 +583,7 @@ class IntradayDipBuyBot:
         self.dip_flag_on = False
         self.lowest_price_value = float('inf')
         self.lowest_price_bar_index = -1
+        self.dip_start_timestamp = None
 
 if __name__ == "__main__":
     bot = None

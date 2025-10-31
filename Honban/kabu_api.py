@@ -72,6 +72,10 @@ class KabuAPI:
             self.logger.error(f"[ERROR] 注文送信失敗: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 self.logger.error(f"Response content: {e.response.text}")
+                try:
+                    return False, e.response.json()
+                except json.JSONDecodeError:
+                    return False, e.response.text
             return False, str(e)
 
     def send_short_sell_order(self, symbol, exchange, qty, password):
@@ -93,6 +97,9 @@ class KabuAPI:
 
     def send_market_order(self, symbol, exchange, qty, side):
         """成行注文を送信する"""
+        # 売付の場合はFundTypeを'  '（スペース2つ）に、買付の場合は'AA'に設定
+        fund_type = "  " if side == "1" else "AA"
+
         payload = {
             "Password": self.trade_password,
             "Symbol": str(symbol),
@@ -101,7 +108,7 @@ class KabuAPI:
             "Side": side,
             "CashMargin": 1,
             "DelivType": 2,
-            "FundType": "AA",
+            "FundType": fund_type,
             "AccountType": 4,
             "Qty": qty,
             "FrontOrderType": 10,
@@ -111,7 +118,7 @@ class KabuAPI:
         return self._send_order(payload)
 
     def send_stop_sell_order(self, symbol, exchange, qty, password, trigger_price):
-        """逆指値の売り注文を送信する"""
+        """逆指値の売り注文を送信する（参考ファイルベースの修正版）"""
         payload = {
             "Password": password,
             "Symbol": str(symbol),
@@ -119,15 +126,19 @@ class KabuAPI:
             "SecurityType": 1,
             "Side": "1",
             "CashMargin": 1,
-            "DelivType": 2,
-            "FundType": self.trade_type,
+            "DelivType": 0, # 参考ファイルでは0
+            "FundType": "  ",
             "AccountType": 4,
             "Qty": qty,
-            "FrontOrderType": 20,
-            "Condition": {
+            "FrontOrderType": 30, # 参考ファイルでは30
+            "Price": 0, # トリガー後は成行のため0
+            "ExpireDay": 0,
+            "ReverseLimitOrder": {
                 "TriggerSec": 1,
                 "TriggerPrice": trigger_price,
-                "UnderOver": 2
+                "UnderOver": 1, # 1: 以下
+                "AfterHitOrderType": 1, # 1: 成行
+                "AfterHitPrice": 0
             }
         }
         return self._send_order(payload)
@@ -142,29 +153,65 @@ class KabuAPI:
             "Side": "1",
             "CashMargin": 1,
             "DelivType": 2,
-            "FundType": self.trade_type,
+            "FundType": "  ",
             "AccountType": 4,
             "Qty": qty,
-            "FrontOrderType": 13,
+            "FrontOrderType": 20,
             "Price": price
         }
         return self._send_order(payload)
 
-    def get_order(self, order_id):
-        """注文情報を取得する"""
-        url = f"{self.api_url}/orders/{order_id}"
+    def get_orders_list(self, product=None):
+        """注文一覧を取得する"""
+        url = f"{self.api_url}/orders"
         headers = {'Content-Type': 'application/json', 'X-API-KEY': self.token}
+        params = {}
+        if product:
+            params['product'] = product
+
         try:
             verify_ssl = self.api_protocol != 'https'
-            response = requests.get(url, headers=headers, verify=verify_ssl)
+            response = requests.get(url, headers=headers, params=params, verify=verify_ssl)
             response.raise_for_status()
-            order_info = response.json()
+            orders = response.json()
+            self.logger.debug(f"[API] 注文一覧取得成功")
+            return True, orders
+        except requests.RequestException as e:
+            self.logger.error(f"[ERROR] 注文一覧取得失敗: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                self.logger.error(f"Response content: {e.response.text}")
+                try:
+                    return False, e.response.json()
+                except json.JSONDecodeError:
+                    return False, {"Message": e.response.text}
+            return False, {"Message": str(e)}
+
+    def get_order(self, order_id):
+        """注文情報を取得する"""
+        url = f"{self.api_url}/orders"
+        headers = {'Content-Type': 'application/json', 'X-API-KEY': self.token}
+        params = {'orderid': order_id}
+        try:
+            verify_ssl = self.api_protocol != 'https'
+            response = requests.get(url, headers=headers, params=params, verify=verify_ssl)
+            response.raise_for_status()
+            order_info_list = response.json()
+            
+            if not order_info_list:
+                self.logger.warning(f"[API] 注文情報取得失敗: OrderID {order_id} が見つかりません。")
+                return False, {"Code": 4001012, "Message": "注文が見つかりません"} # 互換性のために元のエラーコードに似せる
+
+            order_info = order_info_list[0]
             self.logger.info(f"[API] 注文情報取得成功: {order_info}")
             return True, order_info
         except requests.RequestException as e:
             self.logger.error(f"[ERROR] 注文情報取得失敗: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 self.logger.error(f"Response content: {e.response.text}")
+                try:
+                    return False, e.response.json()
+                except json.JSONDecodeError:
+                    return False, e.response.text
             return False, str(e)
 
     def get_symbol_info(self, symbol, exchange):
@@ -201,6 +248,27 @@ class KabuAPI:
                 self.logger.error(f"Response content: {e.response.text}")
             return False, str(e)
 
+    def get_physical_positions(self):
+        """現物保有銘柄一覧を取得する"""
+        url = f"{self.api_url}/wallet/physical"
+        headers = {'Content-Type': 'application/json', 'X-API-KEY': self.token}
+        try:
+            verify_ssl = self.api_protocol != 'https'
+            response = requests.get(url, headers=headers, verify=verify_ssl)
+            response.raise_for_status()
+            positions = response.json()
+            self.logger.debug(f"[API] 現物保有銘柄一覧の取得成功")
+            return True, positions
+        except requests.RequestException as e:
+            self.logger.error(f"[ERROR] 現物保有銘柄一覧の取得失敗: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                self.logger.error(f"Response content: {e.response.text}")
+                try:
+                    return False, e.response.json()
+                except json.JSONDecodeError:
+                    return False, {"Message": e.response.text}
+            return False, {"Message": str(e)}
+
     def register_symbol(self, ticker, exchange):
         """PUSH通知用の銘柄を登録する"""
         url = f"{self.api_url}/register"
@@ -235,6 +303,10 @@ class KabuAPI:
             self.logger.error(f"[ERROR] 注文キャンセル失敗: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 self.logger.error(f"Response content: {e.response.text}")
+                try:
+                    return False, e.response.json()
+                except json.JSONDecodeError:
+                    return False, e.response.text
             return False, str(e)
 
     def connect_websocket(self, on_message_callback, on_error_callback, on_close_callback, on_open_callback):
